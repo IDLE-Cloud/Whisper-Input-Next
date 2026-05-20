@@ -7,9 +7,11 @@ class InputState(Enum):
     RECORDING = auto()      # 正在录音
     RECORDING_TRANSLATE = auto()  # 正在录音(翻译模式)
     RECORDING_KIMI = auto()     # 正在录音(Kimi润色模式)
+    RECORDING_POLISH = auto()   # 正在录音(润色模式，说完再一次性输出)
     DOUBAO_STREAMING = auto()   # 豆包流式识别中（边说边转）
     PROCESSING = auto()     # 正在处理
     PROCESSING_KIMI = auto()    # 正在处理(Kimi润色模式)
+    PROCESSING_POLISH = auto()  # 正在润色处理
     TRANSLATING = auto()    # 正在翻译
     ERROR = auto()          # 错误状态
     WARNING = auto()        # 警告状态（用于录音时长不足等提示）
@@ -17,7 +19,7 @@ class InputState(Enum):
     @property
     def is_recording(self):
         """检查是否处于录音状态"""
-        return self in (InputState.RECORDING, InputState.RECORDING_TRANSLATE, InputState.RECORDING_KIMI, InputState.DOUBAO_STREAMING)
+        return self in (InputState.RECORDING, InputState.RECORDING_TRANSLATE, InputState.RECORDING_KIMI, InputState.RECORDING_POLISH, InputState.DOUBAO_STREAMING)
     
     @property
     def can_start_recording(self):

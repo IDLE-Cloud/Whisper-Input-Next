@@ -18,10 +18,12 @@ from src.keyboard.inputState import InputState
 from src.transcription.whisper import WhisperProcessor
 from src.utils.logger import logger
 from src.transcription.senseVoiceSmall import SenseVoiceSmallProcessor
+from src.llm.polish import PolishProcessor
 from src.transcription.local_whisper import LocalWhisperProcessor
 from src.transcription.doubao_streaming import DoubaoStreamingProcessor
 from src.ui.status_bar import StatusBarController
 from src.ui.floating_preview import FloatingPreviewWindow
+from src.ui.control_bar import ControlBar
 
 # 版本信息
 __version__ = "3.3.0"
@@ -64,7 +66,18 @@ class VoiceAssistant:
 
         self.status_controller = StatusBarController()
         self.floating_preview = FloatingPreviewWindow()
+        self.control_bar = ControlBar(
+            on_quick_toggle=self._ctrl_quick_toggle,
+            on_polish_toggle=self._ctrl_polish_toggle,
+        )
         self.max_auto_retries = int(os.getenv("AUTO_RETRY_LIMIT", "5"))
+
+        # 润色处理器（可选）
+        try:
+            self.polish_processor = PolishProcessor()
+        except ValueError:
+            logger.warning("未配置 POLISH_API_KEY，润色模式（Ctrl+E）不可用")
+            self.polish_processor = None
 
         # 转录服务配置: "doubao" (默认，流式) 或 "openai" (批量)
         self.transcription_service = os.getenv("TRANSCRIPTION_SERVICE", "doubao")
@@ -86,11 +99,13 @@ class VoiceAssistant:
             logger.info("Ctrl+F 使用 OpenAI 批量转录")
 
         self.keyboard_manager = KeyboardManager(
-            on_record_start=ctrl_f_start,    # Ctrl+F: 根据配置选择
+            on_record_start=ctrl_f_start,
             on_record_stop=ctrl_f_stop,
-            on_translate_start=self.start_translation_recording,  # 保留翻译功能
+            on_translate_start=self.start_translation_recording,
             on_translate_stop=self.stop_translation_recording,
-            on_kimi_start=self.start_local_recording,       # Ctrl+I: Local Whisper
+            on_kimi_start=self.start_local_recording,
+            on_polish_start=self.start_polish_recording,    # Ctrl+E: 润色模式
+            on_polish_stop=self.stop_polish_recording,
             on_kimi_stop=self.stop_local_recording,
             on_reset_state=self.reset_state,
             on_state_change=self._on_state_change,
@@ -158,6 +173,18 @@ class VoiceAssistant:
     def _on_state_change(self, new_state: InputState):
         self._current_state = new_state
         self._notify_status()
+        try:
+            self.control_bar.update_state(new_state.name)
+        except Exception:
+            pass
+
+    def _ctrl_quick_toggle(self):
+        """控制栏快速按钮点击——等效 Ctrl+Q"""
+        self.keyboard_manager.toggle_recording()
+
+    def _ctrl_polish_toggle(self):
+        """控制栏润色按钮点击——等效 Ctrl+空格"""
+        self.keyboard_manager.toggle_polish_recording()
 
     def _notify_status(self):
         queue_length = self.job_queue.qsize()
@@ -423,6 +450,133 @@ class VoiceAssistant:
             max_retries=self.max_auto_retries,
         )
 
+    def start_polish_recording(self):
+        """开始润色录音（Ctrl+E）：复用豆包流式 ASR，全文收集后交 LLM 润色"""
+        if not self.polish_processor:
+            logger.warning("润色处理器不可用，请配置 POLISH_API_KEY")
+            self.keyboard_manager.reset_state()
+            return
+        if not self.doubao_processor or not self.doubao_processor.is_available():
+            logger.warning("润色模式需要豆包 ASR，但豆包未配置")
+            self.keyboard_manager.reset_state()
+            return
+
+        self.floating_preview.show()
+        self.floating_preview.update_text("润色模式：说完按 Ctrl+E ...")
+
+        error = self.audio_recorder.start_streaming_recording()
+        if error:
+            logger.error(f"启动录音失败: {error}")
+            self.floating_preview.hide()
+            self.keyboard_manager.reset_state()
+            return
+
+        def run_polish():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(self._run_polish_streaming())
+            except Exception as e:
+                logger.error(f"润色流式录音异常: {e}")
+            finally:
+                loop.close()
+                if self._current_state not in (InputState.IDLE,):
+                    logger.warning(f"润色线程结束但状态仍为 {self._current_state.name}，强制重置")
+                    self.floating_preview.hide()
+                    self.keyboard_manager.reset_state()
+
+        self._polish_thread = threading.Thread(target=run_polish, daemon=True, name="polish-streaming")
+        self._polish_thread.start()
+
+    async def _run_polish_streaming(self):
+        """豆包流式 ASR 收全文，不实时输出，streaming 结束后交独立线程润色输出"""
+        collected = []
+        asr_error = []
+
+        def on_preview(text):
+            self.floating_preview.update_text(text)
+
+        def on_final(text):
+            if text:
+                collected.append(text)
+
+        def on_complete():
+            pass  # streaming 正常结束，do nothing here
+
+        def on_error(error):
+            asr_error.append(error)
+
+        try:
+            await self.doubao_processor.process_audio_stream(
+                self.audio_recorder.stream_audio_chunks(target_sample_rate=16000),
+                on_preview,
+                on_final,
+                on_complete,
+                on_error,
+                sample_rate=16000,
+                on_definite_text=None,  # 润色模式不实时输出 definite
+            )
+        except Exception as exc:
+            self.audio_recorder.reset_streaming_state(reason=f"润色流式异常: {exc}")
+            self.floating_preview.hide()
+            self.keyboard_manager.reset_state()
+            return
+
+        if asr_error:
+            logger.error(f"ASR 出错: {asr_error[-1]}")
+            self.floating_preview.hide()
+            self.keyboard_manager.reset_state()
+            return
+
+        raw_text = collected[-1] if collected else ""
+        print(f"[DEBUG 润色原文] {raw_text!r}", flush=True)
+
+        if not raw_text:
+            logger.warning("ASR 未返回文本，跳过润色")
+            self.floating_preview.hide()
+            self.keyboard_manager.reset_state()
+            return
+
+        # 在独立线程里做阻塞的 LLM 调用，不阻塞 async 事件循环
+        threading.Thread(
+            target=self._do_polish,
+            args=(raw_text,),
+            daemon=True,
+            name="polish-llm"
+        ).start()
+
+    def _do_polish(self, raw_text: str):
+        """在普通线程里调用 LLM 润色并输出结果。"""
+        self.floating_preview.update_text("润色中，请稍候...")
+        try:
+            polished = self.polish_processor.polish(raw_text)
+            print(f"[DEBUG 润色结果] {polished!r}", flush=True)
+            logger.info(f"[润色结果] {polished!r}")
+            self._save_transcription_cache(
+                self._current_streaming_archive_path,
+                polished, service="polish",
+                model=self.polish_processor.model, mode="polish"
+            )
+            self.floating_preview.hide()
+            import time as _t
+            _t.sleep(0.15)
+            self.keyboard_manager.type_text(polished, None)
+        except Exception as e:
+            logger.error(f"润色失败: {e}")
+            print(f"[DEBUG 润色失败] {e}", flush=True)
+            self.floating_preview.hide()
+            self.keyboard_manager.show_error(f"润色失败: {e}")
+        finally:
+            self.keyboard_manager.reset_state()
+
+    def stop_polish_recording(self):
+        """停止润色录音（Ctrl+E 第二次），让流式 ASR 完成剩余处理"""
+        logger.info("停止润色录音，等待 ASR 完成后润色...")
+        audio = self.audio_recorder.stop_streaming_recording()
+        audio_bytes = self._buffer_to_bytes(audio)
+        if audio_bytes:
+            self._current_streaming_archive_path = self._archive_audio_bytes(audio_bytes)
+
     def start_doubao_streaming(self):
         """开始豆包流式识别"""
         if self.doubao_processor is None or not self.doubao_processor.is_available():
@@ -456,6 +610,10 @@ class VoiceAssistant:
                 self._streaming_loop = None
                 if self._streaming_thread is threading.current_thread():
                     self._streaming_thread = None
+                # 保底：无论发生什么，确保状态回到 IDLE
+                if self._current_state not in (InputState.IDLE,):
+                    logger.warning(f"流式转录线程结束但状态仍为 {self._current_state.name}，强制重置")
+                    self.keyboard_manager.reset_state()
 
         self._streaming_thread = threading.Thread(
             target=run_streaming,
@@ -475,18 +633,40 @@ class VoiceAssistant:
             """收到文本更新，显示在浮动预览窗口（不输入到目标应用）"""
             self.floating_preview.update_text(text)
 
+        typed_definite = []  # 记录已实时输入的 definite 文本（用于 cache 拼接）
+
+        def on_definite_text(delta: str):
+            """实时输入新增的 definite 文本段"""
+            if delta:
+                logger.info(f"[实时输入] {delta!r}")
+                typed_definite.append(delta)
+                self.keyboard_manager.type_text(delta, None)
+
         def on_final_text(text: str):
-            """流式结束，一次性输入最终文本到目标应用"""
+            """输入流式结束后剩余的 pending 文本"""
             if text:
-                logger.info(f"[最终输入] {text}")
+                logger.info(f"[最终输入(pending)] {text!r}")
                 self._save_transcription_cache(
                     self._current_streaming_archive_path,
-                    text,
+                    "".join(typed_definite) + text,
                     service="doubao",
                     model="bigmodel",
                     mode="transcriptions",
                 )
+                self.floating_preview.hide()
+                import time as _time
+                _time.sleep(0.15)
                 self.keyboard_manager.type_text(text, None)
+            else:
+                # 全部都是 definite，只需保存 cache
+                if typed_definite:
+                    self._save_transcription_cache(
+                        self._current_streaming_archive_path,
+                        "".join(typed_definite),
+                        service="doubao",
+                        model="bigmodel",
+                        mode="transcriptions",
+                    )
 
         def on_complete():
             """转录完成"""
@@ -511,6 +691,7 @@ class VoiceAssistant:
                 on_complete,
                 on_error,
                 sample_rate=16000,
+                on_definite_text=on_definite_text,
             )
         except Exception as exc:
             self.audio_recorder.reset_streaming_state(reason=f"豆包流式运行异常: {exc}")

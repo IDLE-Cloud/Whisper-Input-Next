@@ -67,6 +67,9 @@ class DoubaoStreamingProcessor:
     """豆包流式语音识别处理器"""
 
     def __init__(self):
+        # 新版控制台：单个 X-Api-Key
+        self.api_key = os.getenv("DOUBAO_API_KEY", "")
+        # 旧版控制台：App Key + Access Key（兼容保留）
         self.app_key = os.getenv("DOUBAO_APP_KEY", "")
         self.access_key = os.getenv("DOUBAO_ACCESS_KEY", "")
         # 使用优化版双向流式接口
@@ -76,14 +79,31 @@ class DoubaoStreamingProcessor:
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
         self._seq = 1
         self._is_connected = False
-        self._sample_rate = DEFAULT_SAMPLE_RATE  # 默认采样率，会在连接时更新
+        self._sample_rate = DEFAULT_SAMPLE_RATE
 
-        if not self.app_key or not self.access_key:
-            logger.warning("豆包 API Key 未配置，请设置 DOUBAO_APP_KEY 和 DOUBAO_ACCESS_KEY")
+        if not self.is_available():
+            logger.warning("豆包 API Key 未配置，请设置 DOUBAO_API_KEY（新版控制台）或 DOUBAO_APP_KEY + DOUBAO_ACCESS_KEY（旧版控制台）")
 
     def is_available(self) -> bool:
-        """检查是否可用（API Key 是否配置）"""
-        return bool(self.app_key and self.access_key)
+        """检查是否可用（新版单 Key 或旧版双 Key 均可）"""
+        return bool(self.api_key) or bool(self.app_key and self.access_key)
+
+    def _build_auth_headers(self) -> dict:
+        """根据配置的 Key 类型生成鉴权 Header"""
+        headers = {
+            "X-Api-Resource-Id": "volc.seedasr.sauc.duration",
+            "X-Api-Connect-Id": str(uuid.uuid4()),
+        }
+        if self.api_key:
+            # 新版控制台：单个 X-Api-Key
+            headers["X-Api-Key"] = self.api_key
+            logger.info("使用新版控制台 X-Api-Key 鉴权")
+        else:
+            # 旧版控制台：App Key + Access Key
+            headers["X-Api-App-Key"] = self.app_key
+            headers["X-Api-Access-Key"] = self.access_key
+            logger.info("使用旧版控制台 App Key + Access Key 鉴权")
+        return headers
 
     def _gzip_compress(self, data: bytes) -> bytes:
         return gzip.compress(data)
@@ -277,12 +297,7 @@ class DoubaoStreamingProcessor:
 
         try:
             self._session = aiohttp.ClientSession()
-            headers = {
-                "X-Api-Resource-Id": "volc.seedasr.sauc.duration",  # 2.0版本小时版
-                "X-Api-Connect-Id": str(uuid.uuid4()),
-                "X-Api-Access-Key": self.access_key,
-                "X-Api-App-Key": self.app_key
-            }
+            headers = self._build_auth_headers()
 
             self._ws = await self._session.ws_connect(
                 self.ws_url,
@@ -372,7 +387,8 @@ class DoubaoStreamingProcessor:
         on_final_text: Callable[[str], None],
         on_complete: Callable[[], None],
         on_error: Callable[[str], None],
-        sample_rate: int = DEFAULT_SAMPLE_RATE
+        sample_rate: int = DEFAULT_SAMPLE_RATE,
+        on_definite_text: Optional[Callable[[str], None]] = None,
     ):
         """
         流式处理音频
@@ -408,6 +424,7 @@ class DoubaoStreamingProcessor:
                 return
 
             final_text = ""
+            last_definite = ""  # 上次已推送的 definite 文本，用于计算增量
 
             # 启动发送任务
             chunk_count = 0
@@ -418,7 +435,6 @@ class DoubaoStreamingProcessor:
                     chunk_count += 1
                     logger.debug(f"📤 发送音频块 #{chunk_count}: {len(chunk)} bytes")
                     await self.send_audio_chunk(chunk, is_last=False)
-                # 发送最后一包
                 logger.info(f"📤 发送完成，共 {chunk_count} 个音频块，发送结束标记")
                 await self.send_audio_chunk(b"", is_last=True)
 
@@ -427,7 +443,7 @@ class DoubaoStreamingProcessor:
             consecutive_errors = 0
             MAX_CONSECUTIVE_ERRORS = 3
             async def receiver():
-                nonlocal final_text, recv_count, consecutive_errors
+                nonlocal final_text, recv_count, consecutive_errors, last_definite
                 logger.info("📥 开始接收结果...")
                 while True:
                     result = await self.receive_result()
@@ -446,27 +462,41 @@ class DoubaoStreamingProcessor:
                             break
                         continue
 
-                    consecutive_errors = 0  # 成功接收，重置错误计数
+                    consecutive_errors = 0
 
-                    # 合并 definite + pending 作为当前全量预览
-                    current_text = result.definite_text + result.pending_text
-                    if current_text:
-                        on_preview_text(current_text)
-                        # 持续更新最终文本（每次都取最新的全量文本）
-                        final_text = current_text
+                    # 有新增 definite 文本时，推送增量给 on_definite_text
+                    if on_definite_text and result.definite_text and result.definite_text != last_definite:
+                        delta = result.definite_text[len(last_definite):]
+                        if delta:
+                            on_definite_text(delta)
+                        last_definite = result.definite_text
+
+                    # preview 只显示 pending 部分（definite 已实时输入，不重复显示）
+                    if on_definite_text:
+                        if result.pending_text:
+                            on_preview_text(result.pending_text)
+                    else:
+                        # 未启用流式输入时，保持原有全量预览行为
+                        current_text = result.definite_text + result.pending_text
+                        if current_text:
+                            on_preview_text(current_text)
+
+                    final_text = result.definite_text + result.pending_text
 
                     if result.is_final:
                         logger.info(f"📥 接收完成，共收到 {recv_count} 个结果，最终文本: '{final_text}'")
                         break
 
-            # 并行执行发送和接收
             sender_task = asyncio.create_task(sender())
             receiver_task = asyncio.create_task(receiver())
-
             await asyncio.gather(sender_task, receiver_task)
 
-            # 流式结束后一次性输出最终文本
-            if final_text:
+            # 流式结束：输出尚未通过 definite 推送的剩余文本（pending 部分）
+            remaining = final_text[len(last_definite):]
+            if remaining:
+                on_final_text(remaining)
+            elif not last_definite and final_text:
+                # 没有任何 definite 段（极短录音），全量输出
                 on_final_text(final_text)
 
             on_complete()
