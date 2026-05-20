@@ -16,8 +16,12 @@ ALLOWED_DEVICE_KEYWORDS = [
     "dji mic",                # DJI Mic 系列无线麦克风（最高优先级）
     "wireless mic",           # DJI Wireless Mic 等无线麦克风
     "external microphone",    # 外接麦克风/耳机
-    "macbook pro microphone", # 内置麦克风
+    "macbook pro microphone", # macOS 内置麦克风
     "airpods",                # AirPods 蓝牙耳机
+    # Windows 常见设备名
+    "microphone",             # Windows 通用麦克风（Realtek, USB 等）
+    "headset",                # 耳机麦克风
+    "input",                  # 通用输入设备
 ]
 
 

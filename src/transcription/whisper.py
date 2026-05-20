@@ -50,8 +50,8 @@ class WhisperProcessor:
     def __init__(self):
         self.convert_to_simplified = os.getenv("CONVERT_TO_SIMPLIFIED", "false").lower() == "true"
         self.cc = OpenCC('t2s') if self.convert_to_simplified else None
-        self.symbol = SymbolProcessor()
         self.add_symbol = os.getenv("ADD_SYMBOL", "false").lower() == "true"
+        self.symbol = SymbolProcessor() if self.add_symbol else None
         self.optimize_result = os.getenv("OPTIMIZE_RESULT", "false").lower() == "true"
         self.service_platform = os.getenv("SERVICE_PLATFORM", "groq").lower()
         self.timeout_seconds = self.OPENAI_TIMEOUT if self.service_platform == "openai" else self.DEFAULT_TIMEOUT

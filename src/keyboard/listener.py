@@ -2,26 +2,30 @@ from pynput.keyboard import Controller, Key, Listener
 import pyperclip
 from ..utils.logger import logger
 import time
+import sys
 from .inputState import InputState
 import os
 
 
 class KeyboardManager:
-    def __init__(self, on_record_start, on_record_stop, on_translate_start, on_translate_stop, on_kimi_start, on_kimi_stop, on_reset_state, on_state_change=None):
+    def __init__(self, on_record_start, on_record_stop, on_translate_start, on_translate_stop, on_kimi_start, on_kimi_stop, on_reset_state, on_state_change=None, on_polish_start=None, on_polish_stop=None):
         self.keyboard = Controller()
-        self.ctrl_pressed = False  # 改为ctrl键状态
-        self.f_pressed = False  # F键状态
-        self.i_pressed = False  # I键状态
-        self.temp_text_length = 0  # 用于跟踪临时文本的长度
-        self.processing_text = None  # 用于跟踪正在处理的文本
-        self.error_message = None  # 用于跟踪错误信息
-        self.warning_message = None  # 用于跟踪警告信息
-        self.is_recording = False  # toggle模式的录音状态
-        self.last_key_time = 0  # 防止重复触发
-        self.KEY_DEBOUNCE_TIME = 0.3  # 按键防抖时间（秒）
-        self._original_clipboard = None  # 保存原始剪贴板内容
-        
-        
+        self.ctrl_pressed = False
+        self.f_pressed = False
+        self.i_pressed = False
+        self.e_pressed = False
+        self.space_pressed = False  # 润色模式（Ctrl+空格）
+        self.temp_text_length = 0
+        self.processing_text = None
+        self.error_message = None
+        self.warning_message = None
+        self.is_recording = False
+        self.last_key_time = 0
+        self.KEY_DEBOUNCE_TIME = 0.3
+        self._original_clipboard = None
+        self._target_hwnd = None
+        self._start_focus_tracker()
+
         # 回调函数
         self.on_record_start = on_record_start
         self.on_record_stop = on_record_stop
@@ -31,6 +35,8 @@ class KeyboardManager:
         self.on_kimi_stop = on_kimi_stop
         self.on_reset_state = on_reset_state
         self.on_state_change = on_state_change
+        self.on_polish_start = on_polish_start
+        self.on_polish_stop = on_polish_stop
 
         
         # 状态管理
@@ -40,18 +46,20 @@ class KeyboardManager:
             InputState.RECORDING: "0",
             InputState.RECORDING_TRANSLATE: "0",
             InputState.RECORDING_KIMI: "0",
+            InputState.RECORDING_POLISH: "0",
             InputState.PROCESSING: "1",
             InputState.PROCESSING_KIMI: "1",
+            InputState.PROCESSING_POLISH: "1",
             InputState.TRANSLATING: "1",
-            InputState.ERROR: lambda msg: f"{msg}",  # 错误消息使用函数动态生成
-            InputState.WARNING: lambda msg: f"! {msg}"  # 警告消息使用感叹号
+            InputState.ERROR: lambda msg: f"{msg}",
+            InputState.WARNING: lambda msg: f"! {msg}"
         }
 
         self.state_symbol_enabled = True
 
-        # 获取系统平台
+        # 获取系统平台（支持 .env 配置或自动检测）
         sysetem_platform = os.getenv("SYSTEM_PLATFORM")
-        if sysetem_platform == "win" :
+        if sysetem_platform == "win" or (sysetem_platform is None and sys.platform == "win32"):
             self.sysetem_platform = Key.ctrl
             logger.info("配置到Windows平台")
         else:
@@ -236,10 +244,13 @@ class KeyboardManager:
         try:
             logger.info("正在输入转录文本...")
             self._delete_previous_text()
-            
+
+            # 还原焦点到录音前的目标窗口，确保粘贴到正确位置
+            self._restore_target_window()
+
             # 最终转录文本通过剪贴板输入
             pyperclip.copy(text)
-            
+
             # 模拟 Ctrl + V 粘贴文本
             with self.keyboard.pressed(self.sysetem_platform):
                 self.keyboard.press('v')
@@ -251,7 +262,8 @@ class KeyboardManager:
             logger.info("文本输入完成")
 
             # 清理处理状态（流式识别中不重置，保持录音状态）
-            if self.state != InputState.DOUBAO_STREAMING:
+            # 录音状态中输出文字（流式 definite 输出），不重置状态
+            if not self.state.is_recording:
                 self.state = InputState.IDLE
         except Exception as e:
             logger.error(f"文本输入失败: {e}")
@@ -295,6 +307,61 @@ class KeyboardManager:
         # 更新临时文本长度
         self.temp_text_length = len(text)
     
+    def _start_focus_tracker(self) -> None:
+        """后台线程持续跟踪前台窗口，自动更新粘贴目标（排除本进程窗口）。"""
+        if sys.platform != 'win32':
+            return
+        import ctypes
+        import os as _os
+
+        our_pid = _os.getpid()
+
+        def _track():
+            prev_hwnd = None
+            while True:
+                try:
+                    hwnd = ctypes.windll.user32.GetForegroundWindow()
+                    if hwnd and hwnd != prev_hwnd:
+                        pid = ctypes.c_ulong(0)
+                        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                        if pid.value != our_pid:
+                            self._target_hwnd = hwnd
+                        prev_hwnd = hwnd
+                except Exception:
+                    pass
+                time.sleep(0.3)
+
+        import threading as _th
+        t = _th.Thread(target=_track, daemon=True, name="focus-tracker")
+        t.start()
+
+    def _save_target_window(self) -> None:
+        """保存当前前台窗口句柄（焦点跟踪线程已实时维护，此处作备用）。"""
+        if sys.platform == 'win32' and not getattr(self, '_target_hwnd', None):
+            try:
+                import ctypes
+                self._target_hwnd = ctypes.windll.user32.GetForegroundWindow()
+            except Exception:
+                self._target_hwnd = None
+
+    def _restore_target_window(self) -> None:
+        """还原焦点到录音前的目标窗口。"""
+        if sys.platform != 'win32' or not getattr(self, '_target_hwnd', None):
+            return
+        try:
+            import ctypes
+            hwnd = self._target_hwnd
+            # AttachThreadInput 技巧：绕过 Windows 前台窗口限制
+            fg_thread = ctypes.windll.user32.GetWindowThreadProcessId(hwnd, None)
+            cur_thread = ctypes.windll.kernel32.GetCurrentThreadId()
+            ctypes.windll.user32.AttachThreadInput(cur_thread, fg_thread, True)
+            ctypes.windll.user32.SetForegroundWindow(hwnd)
+            ctypes.windll.user32.BringWindowToTop(hwnd)
+            ctypes.windll.user32.AttachThreadInput(cur_thread, fg_thread, False)
+            time.sleep(0.15)
+        except Exception as e:
+            logger.warning(f"还原目标窗口失败: {e}")
+
     def toggle_recording(self):
         """切换录音状态"""
         current_time = time.time()
@@ -304,9 +371,10 @@ class KeyboardManager:
             return
 
         self.last_key_time = current_time
-        
+
         if not self.is_recording:
-            # 开始录音
+            # 开始录音前记住目标窗口
+            self._save_target_window()
             if self.state.can_start_recording:
                 self.is_recording = True
                 self.state = InputState.RECORDING
@@ -339,46 +407,100 @@ class KeyboardManager:
             self.state = InputState.PROCESSING_KIMI
             logger.info("⏹️ 停止录音（本地 Whisper 模式）")
 
+    def toggle_polish_recording(self):
+        """切换润色录音状态（Ctrl+E）：说完后交 LLM 润色再输出"""
+        current_time = time.time()
+
+        if current_time - self.last_key_time < self.KEY_DEBOUNCE_TIME:
+            return
+        self.last_key_time = current_time
+
+        if not self.is_recording:
+            if self.state.can_start_recording:
+                self._save_target_window()
+                self.is_recording = True
+                self.state = InputState.RECORDING_POLISH
+                if self.on_polish_start:
+                    self.on_polish_start()
+                logger.info("✏️ 开始润色录音（说完按 Ctrl+E 结束）")
+        else:
+            self.is_recording = False
+            self.state = InputState.PROCESSING_POLISH
+            if self.on_polish_stop:
+                self.on_polish_stop()
+            logger.info("⏹️ 停止润色录音，等待 LLM 润色...")
+
+    # Ctrl/Shift/Alt 的左右变体映射
+    _KEY_VARIANTS = {
+        Key.ctrl: (Key.ctrl, Key.ctrl_l, Key.ctrl_r),
+        Key.ctrl_l: (Key.ctrl, Key.ctrl_l, Key.ctrl_r),
+        Key.ctrl_r: (Key.ctrl, Key.ctrl_l, Key.ctrl_r),
+        Key.shift: (Key.shift, Key.shift_l, Key.shift_r),
+        Key.shift_l: (Key.shift, Key.shift_l, Key.shift_r),
+        Key.shift_r: (Key.shift, Key.shift_l, Key.shift_r),
+        Key.alt: (Key.alt, Key.alt_l, Key.alt_r),
+        Key.alt_l: (Key.alt, Key.alt_l, Key.alt_r),
+        Key.alt_r: (Key.alt, Key.alt_l, Key.alt_r),
+    }
+
+    def _match_special_key(self, key, target) -> bool:
+        """匹配特殊键，兼容左右变体（Key.ctrl_l 匹配 Key.ctrl 等）"""
+        if key == target:
+            return True
+        variants = self._KEY_VARIANTS.get(target)
+        if variants and key in variants:
+            return True
+        return False
+
+    def _match_char_key(self, key, char: str) -> bool:
+        """匹配字符键，兼容 Ctrl 组合键时 key.char 变为控制字符的情况"""
+        if hasattr(key, 'char') and key.char == char:
+            return True
+        if hasattr(key, 'vk') and key.vk == ord(char.upper()):
+            return True
+        return False
+
     def on_press(self, key):
         """按键按下时的回调"""
         try:
             # 检查转录按钮（字符键或特殊键）
             is_transcription_key = False
             if isinstance(self.transcriptions_button, str):
-                # 字符键
-                is_transcription_key = hasattr(key, 'char') and key.char == self.transcriptions_button
+                is_transcription_key = self._match_char_key(key, self.transcriptions_button)
             else:
                 # 特殊键
-                is_transcription_key = key == self.transcriptions_button
-                
+                is_transcription_key = self._match_special_key(key, self.transcriptions_button)
+
             # 检查翻译按钮（字符键或特殊键）
             is_translation_key = False
             if isinstance(self.translations_button, str):
-                # 字符键
-                is_translation_key = hasattr(key, 'char') and key.char == self.translations_button
+                is_translation_key = self._match_char_key(key, self.translations_button)
             else:
                 # 特殊键
-                is_translation_key = key == self.translations_button
-            
-            # 检查I键（用于本地 Whisper 模式）
-            if hasattr(key, 'char') and key.char == 'i':
+                is_translation_key = self._match_special_key(key, self.translations_button)
+
+            # 检查空格键（润色模式 Ctrl+空格）
+            if key == Key.space:
+                self.space_pressed = True
+                if self.ctrl_pressed and self.space_pressed:
+                    self.toggle_polish_recording()
+            # 检查I键（本地 Whisper 模式）
+            elif self._match_char_key(key, 'i'):
                 self.i_pressed = True
-                # 检查是否同时按下了ctrl+i（本地 Whisper 模式）
                 if self.ctrl_pressed and self.i_pressed:
                     self.toggle_kimi_recording()
-            elif is_transcription_key:  # F键
+            elif is_transcription_key:
                 self.f_pressed = True
-                # 检查是否同时按下了ctrl+f
                 if self.ctrl_pressed and self.f_pressed:
                     self.toggle_recording()
             elif is_translation_key:  # Ctrl键
                 self.ctrl_pressed = True
-                # 检查是否同时按下了ctrl+f（OpenAI GPT-4o transcribe 模式）
                 if self.ctrl_pressed and self.f_pressed:
                     self.toggle_recording()
-                # 检查是否同时按下了ctrl+i（本地 Whisper 模式）
                 elif self.ctrl_pressed and self.i_pressed:
                     self.toggle_kimi_recording()
+                elif self.ctrl_pressed and self.space_pressed:
+                    self.toggle_polish_recording()
         except AttributeError:
             pass
 
@@ -388,27 +510,24 @@ class KeyboardManager:
             # 检查转录按钮（字符键或特殊键）
             is_transcription_key = False
             if isinstance(self.transcriptions_button, str):
-                # 字符键
-                is_transcription_key = hasattr(key, 'char') and key.char == self.transcriptions_button
+                is_transcription_key = self._match_char_key(key, self.transcriptions_button)
             else:
-                # 特殊键
-                is_transcription_key = key == self.transcriptions_button
-                
+                is_transcription_key = self._match_special_key(key, self.transcriptions_button)
+
             # 检查翻译按钮（字符键或特殊键）
             is_translation_key = False
             if isinstance(self.translations_button, str):
-                # 字符键
-                is_translation_key = hasattr(key, 'char') and key.char == self.translations_button
+                is_translation_key = self._match_char_key(key, self.translations_button)
             else:
-                # 特殊键
-                is_translation_key = key == self.translations_button
-                
-            # 检查I键释放
-            if hasattr(key, 'char') and key.char == 'i':
+                is_translation_key = self._match_special_key(key, self.translations_button)
+
+            if key == Key.space:
+                self.space_pressed = False
+            elif self._match_char_key(key, 'i'):
                 self.i_pressed = False
-            elif is_transcription_key:  # F键释放
+            elif is_transcription_key:
                 self.f_pressed = False
-            elif is_translation_key:  # Ctrl键释放
+            elif is_translation_key:
                 self.ctrl_pressed = False
 
         except AttributeError:

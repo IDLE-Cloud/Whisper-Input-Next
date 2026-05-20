@@ -1,13 +1,22 @@
 import logging
 import colorlog
 import os
+import sys
 from logging.handlers import RotatingFileHandler
 
 def setup_logger():
     """配置彩色日志"""
     # 创建logs目录
     os.makedirs('logs', exist_ok=True)
-    
+
+    # Windows GBK 终端强制用 UTF-8，避免 emoji 报 UnicodeEncodeError
+    if sys.platform == 'win32' and hasattr(sys.stdout, 'reconfigure'):
+        try:
+            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
+
     # 控制台处理器
     console_handler = colorlog.StreamHandler()
     console_handler.setFormatter(colorlog.ColoredFormatter(
