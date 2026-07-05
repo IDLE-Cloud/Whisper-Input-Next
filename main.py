@@ -636,11 +636,16 @@ class VoiceAssistant:
         typed_definite = []  # 记录已实时输入的 definite 文本（用于 cache 拼接）
 
         def on_definite_text(delta: str):
-            """实时输入新增的 definite 文本段"""
+            """实时输入新增的 definite 文本段（在线程中执行，避免阻塞事件循环）"""
             if delta:
                 logger.info(f"[实时输入] {delta!r}")
                 typed_definite.append(delta)
-                self.keyboard_manager.type_text(delta, None)
+                threading.Thread(
+                    target=self.keyboard_manager.type_text,
+                    args=(delta, None),
+                    daemon=True,
+                    name="type-text"
+                ).start()
 
         def on_final_text(text: str):
             """输入流式结束后剩余的 pending 文本"""

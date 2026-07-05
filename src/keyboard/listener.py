@@ -3,6 +3,7 @@ import pyperclip
 from ..utils.logger import logger
 import time
 import sys
+import threading
 from .inputState import InputState
 import os
 
@@ -24,6 +25,8 @@ class KeyboardManager:
         self.KEY_DEBOUNCE_TIME = 0.3
         self._original_clipboard = None
         self._target_hwnd = None
+        self._type_lock = threading.Lock()
+        self._is_typing = False
         self._start_focus_tracker()
 
         # 回调函数
@@ -222,7 +225,7 @@ class KeyboardManager:
 
     def type_text(self, text, error_message=None):
         """将文字输入到当前光标位置
-        
+
         Args:
             text: 要输入的文本或包含文本和错误信息的元组
             error_message: 错误信息
@@ -230,44 +233,48 @@ class KeyboardManager:
         # 如果text是元组，说明是从process_audio返回的结果
         if isinstance(text, tuple):
             text, error_message = text
-            
+
         if error_message:
             self.show_error(error_message)
             return
-            
+
         if not text:
             # 如果没有文本且不是错误，可能是录音时长不足
             if self.state in (InputState.PROCESSING, InputState.TRANSLATING):
                 self.show_warning("录音时长过短，请至少录制1秒")
             return
-            
-        try:
-            logger.info("正在输入转录文本...")
-            self._delete_previous_text()
 
-            # 还原焦点到录音前的目标窗口，确保粘贴到正确位置
-            self._restore_target_window()
+        with self._type_lock:
+            self._is_typing = True
+            try:
+                logger.info("正在输入转录文本...")
+                self._delete_previous_text()
 
-            # 最终转录文本通过剪贴板输入
-            pyperclip.copy(text)
+                # 还原焦点到录音前的目标窗口，确保粘贴到正确位置
+                self._restore_target_window()
 
-            # 模拟 Ctrl + V 粘贴文本
-            with self.keyboard.pressed(self.sysetem_platform):
-                self.keyboard.press('v')
-                self.keyboard.release('v')
-            
-            # 等待一小段时间确保文本已输入
-            time.sleep(0.5)
-            
-            logger.info("文本输入完成")
+                # 最终转录文本通过剪贴板输入
+                pyperclip.copy(text)
 
-            # 清理处理状态（流式识别中不重置，保持录音状态）
-            # 录音状态中输出文字（流式 definite 输出），不重置状态
-            if not self.state.is_recording:
-                self.state = InputState.IDLE
-        except Exception as e:
-            logger.error(f"文本输入失败: {e}")
-            self.show_error(f"❌ 文本输入失败: {e}")
+                # 模拟 Ctrl + V 粘贴文本
+                with self.keyboard.pressed(self.sysetem_platform):
+                    self.keyboard.press('v')
+                    self.keyboard.release('v')
+
+                # 等待一小段时间确保文本已输入
+                time.sleep(0.5)
+
+                logger.info("文本输入完成")
+
+                # 清理处理状态（流式识别中不重置，保持录音状态）
+                # 录音状态中输出文字（流式 definite 输出），不重置状态
+                if not self.state.is_recording:
+                    self.state = InputState.IDLE
+            except Exception as e:
+                logger.error(f"文本输入失败: {e}")
+                self.show_error(f"❌ 文本输入失败: {e}")
+            finally:
+                self._is_typing = False
     
     def _delete_previous_text(self):
         """删除之前输入的临时文本"""
@@ -462,6 +469,8 @@ class KeyboardManager:
 
     def on_press(self, key):
         """按键按下时的回调"""
+        if self._is_typing:
+            return
         try:
             # 检查转录按钮（字符键或特殊键）
             is_transcription_key = False
@@ -506,6 +515,8 @@ class KeyboardManager:
 
     def on_release(self, key):
         """按键释放时的回调"""
+        if self._is_typing:
+            return
         try:
             # 检查转录按钮（字符键或特殊键）
             is_transcription_key = False
